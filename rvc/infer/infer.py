@@ -9,6 +9,7 @@ import traceback
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
+import subprocess
 from pedalboard import (
     Pedalboard,
     Chorus,
@@ -60,6 +61,51 @@ class VoiceConverter:
         self.n_spk = None  # Number of speakers in the model
         self.use_f0 = None  # Whether the model uses F0
         self.loaded_model = None
+
+    def preprocess_audio(self, audio_input_path: str, sid: int = 0):
+        """
+        Pre-processes and sanitizes an audio file using FFmpeg to prevent errors.
+        Converts the audio to a temporary WAV file at the required 16kHz sample rate.
+        Returns the path to the temporary, cleaned audio file.
+        """
+        if not os.path.exists(audio_input_path):
+            raise FileNotFoundError(f"Input audio file not found at: {audio_input_path}")
+
+        print("-> Starting audio pre-processing...")
+        
+        temp_dir = os.path.join(now_dir, "assets", "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        base_name = os.path.basename(audio_input_path)
+        file_name_without_ext = os.path.splitext(base_name)[0]
+        
+        output_filename = f"{file_name_without_ext}_cleaned_{os.getpid()}_{sid}.wav"
+        clean_audio_path = os.path.join(temp_dir, output_filename)
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i", audio_input_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            clean_audio_path
+        ]
+
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            print(f"-> Audio pre-processing successful. Clean file at: {clean_audio_path}")
+            return clean_audio_path
+        except FileNotFoundError:
+            error_message = "ERROR: ffmpeg is not installed or not found in your system's PATH."
+            print(error_message)
+            raise RuntimeError(error_message)
+        except subprocess.CalledProcessError as e:
+            error_message = (f"ERROR: FFmpeg failed to process audio file: {audio_input_path}.\n"
+                             f"FFmpeg command: {' '.join(command)}\n"
+                             f"FFmpeg stderr: {e.stderr}")
+            print(error_message)
+            raise RuntimeError(error_message)
 
     def load_hubert(self, embedder_model: str, embedder_model_custom: str = None):
         """
@@ -218,30 +264,7 @@ class VoiceConverter:
         **kwargs,
     ):
         """
-        Performs voice conversion on the input audio.
-
-        Args:
-            pitch (int): Key for F0 up-sampling.
-            index_rate (float): Rate for index matching.
-            volume_envelope (int): RMS mix rate.
-            protect (float): Protection rate for certain audio segments.
-            hop_length (int): Hop length for audio processing.
-            f0_method (str): Method for F0 extraction.
-            audio_input_path (str): Path to the input audio file.
-            audio_output_path (str): Path to the output audio file.
-            model_path (str): Path to the voice conversion model.
-            index_path (str): Path to the index file.
-            split_audio (bool): Whether to split the audio for processing.
-            f0_autotune (bool): Whether to use F0 autotune.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
-            export_format (str): Format for exporting the audio.
-            f0_file (str): Path to the F0 file.
-            embedder_model (str): Path to the embedder model.
-            embedder_model_custom (str): Path to the custom embedder model.
-            resample_sr (int, optional): Resample sampling rate. Default is 0.
-            sid (int, optional): Speaker ID. Default is 0.
-            **kwargs: Additional keyword arguments.
+        Performs voice conversion on the input audio with a robust pre-processing pipeline.
         """
         if not model_path:
             print("No model path provided. Aborting conversion.")
@@ -249,12 +272,17 @@ class VoiceConverter:
 
         self.get_vc(model_path, sid)
 
+        clean_audio_path = None
         try:
-            start_time = time.time()
-            print(f"Converting audio '{audio_input_path}'...")
+            clean_audio_path = self.preprocess_audio(audio_input_path, sid)
 
+            start_time = time.time()
+            print(f"Starting conversion for '{audio_input_path}'...")
+
+            # --- DIAGNOSTIC CODE REMOVED ---
+            
             audio = load_audio_infer(
-                audio_input_path,
+                clean_audio_path,
                 16000,
                 **kwargs,
             )
@@ -268,11 +296,7 @@ class VoiceConverter:
                 self.last_embedder_model = embedder_model
 
             file_index = (
-                index_path.strip()
-                .strip('"')
-                .strip("\n")
-                .strip('"')
-                .strip()
+                index_path.strip().strip('"').strip("\n").strip('"').strip()
                 .replace("trained", "added")
             )
 
@@ -283,69 +307,62 @@ class VoiceConverter:
                 chunks, intervals = process_audio(audio, 16000)
                 print(f"Audio split into {len(chunks)} chunks for processing.")
             else:
-                chunks = []
-                chunks.append(audio)
+                chunks = [audio]
 
             converted_chunks = []
-            for c in chunks:
+            for i, c in enumerate(chunks):
+                if split_audio:
+                    print(f"Converting audio chunk {i + 1}/{len(chunks)}")
                 audio_opt = self.vc.pipeline(
-                    model=self.hubert_model,
-                    net_g=self.net_g,
-                    sid=sid,
-                    audio=c,
-                    pitch=pitch,
-                    f0_method=f0_method,
-                    file_index=file_index,
-                    index_rate=index_rate,
-                    pitch_guidance=self.use_f0,
-                    volume_envelope=volume_envelope,
-                    version=self.version,
-                    protect=protect,
-                    f0_autotune=f0_autotune,
+                    model=self.hubert_model, net_g=self.net_g, sid=sid, audio=c,
+                    pitch=pitch, f0_method=f0_method, file_index=file_index,
+                    index_rate=index_rate, pitch_guidance=self.use_f0,
+                    volume_envelope=volume_envelope, version=self.version,
+                    protect=protect, f0_autotune=f0_autotune,
                     f0_autotune_strength=f0_autotune_strength,
                     proposed_pitch=proposed_pitch,
                     proposed_pitch_threshold=proposed_pitch_threshold,
                 )
                 converted_chunks.append(audio_opt)
-                if split_audio:
-                    print(f"Converted audio chunk {len(converted_chunks)}")
 
             if split_audio:
-                audio_opt = merge_audio(
-                    chunks, converted_chunks, intervals, 16000, self.tgt_sr
-                )
+                audio_opt = merge_audio(chunks, converted_chunks, intervals, 16000, self.tgt_sr)
             else:
                 audio_opt = converted_chunks[0]
 
             if clean_audio:
-                cleaned_audio = self.remove_audio_noise(
-                    audio_opt, self.tgt_sr, clean_strength
-                )
+                cleaned_audio = self.remove_audio_noise(audio_opt, self.tgt_sr, clean_strength)
                 if cleaned_audio is not None:
                     audio_opt = cleaned_audio
 
             if post_process:
                 audio_opt = self.post_process_audio(
-                    audio_input=audio_opt,
-                    sample_rate=self.tgt_sr,
-                    **kwargs,
+                    audio_input=audio_opt, sample_rate=self.tgt_sr, **kwargs,
                 )
 
             sf.write(audio_output_path, audio_opt, self.tgt_sr, format="WAV")
-            output_path_format = audio_output_path.replace(
-                ".wav", f".{export_format.lower()}"
-            )
-            audio_output_path = self.convert_audio_format(
-                audio_output_path, output_path_format, export_format
-            )
-
+            
+            final_output_path = audio_output_path
+            if export_format.upper() != "WAV":
+                output_path_format = audio_output_path.replace(".wav", f".{export_format.lower()}")
+                self.convert_audio_format(audio_output_path, output_path_format, export_format)
+                os.remove(audio_output_path)
+                final_output_path = output_path_format
+            
             elapsed_time = time.time() - start_time
-            print(
-                f"Conversion completed at '{audio_output_path}' in {elapsed_time:.2f} seconds."
-            )
+            print(f"Conversion completed at '{final_output_path}' in {elapsed_time:.2f} seconds.")
+
         except Exception as error:
-            print(f"An error occurred during audio conversion: {error}")
+            print(f"An error occurred during the conversion pipeline: {error}")
             print(traceback.format_exc())
+
+        finally:
+            if clean_audio_path and os.path.exists(clean_audio_path):
+                try:
+                    os.remove(clean_audio_path)
+                    print(f"-> Cleaned up temporary file: {clean_audio_path}")
+                except Exception as e:
+                    print(f"Error cleaning up temporary file {clean_audio_path}: {e}")
 
     def convert_audio_batch(
         self,
